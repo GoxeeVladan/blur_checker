@@ -57,6 +57,9 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeLensDirtyScore(bitmap: Bitmap): Double {
+    if(isSolidColor(bitmap, 0.3f)) {
+      return 0.0 // Solid color images are not considered dirty
+    }
     val lapResult = computeLaplacianResult(bitmap)
     val laplacianStd = lapResult.stdDev
     val edgeCount = lapResult.edgeCount
@@ -94,7 +97,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
-    val scaleFactor = 0.4f
+    val scaleFactor = 0.3f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -138,7 +141,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeGlobalContrastStdDev(bitmap: Bitmap): Double {
-    val scaleFactor = 0.4f
+    val scaleFactor = 0.3f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -155,9 +158,33 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     val variance = values.sumOf { (it - mean).pow(2) } / values.size
     return sqrt(variance)
   }
+  private fun isSolidColor(bitmap: Bitmap, scaleFactor: Float = 0.1f, tolerance: Int = 5): Boolean {
+    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
+    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
+    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
+
+    if (w * h <= 1) return true // Single pixel image is solid
+
+    val firstPixel = scaled.getPixel(0, 0)
+    val firstRed = Color.red(firstPixel)
+    val firstGreen = Color.green(firstPixel)
+    val firstBlue = Color.blue(firstPixel)
+
+    for (y in 0 until h) {
+      for (x in 0 until w) {
+        val pixel = scaled.getPixel(x, y)
+        if (kotlin.math.abs(Color.red(pixel) - firstRed) > tolerance ||
+          kotlin.math.abs(Color.green(pixel) - firstGreen) > tolerance ||
+          kotlin.math.abs(Color.blue(pixel) - firstBlue) > tolerance) {
+          return false // Not a solid color
+        }
+      }
+    }
+    return true // All pixels are within the tolerance
+  }
 
   private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
-    val scaleFactor = 0.4f
+    val scaleFactor = 0.3f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -195,7 +222,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeAverageBrightness(bitmap: Bitmap): Double {
-    val scaleFactor = 0.4f
+    val scaleFactor = 0.3f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -211,7 +238,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeTenengradScore(bitmap: Bitmap): Double {
-    val scaleFactor = 0.4f
+    val scaleFactor = 0.3f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
