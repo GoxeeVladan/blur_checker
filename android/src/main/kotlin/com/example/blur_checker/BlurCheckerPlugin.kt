@@ -57,7 +57,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeLensDirtyScore(bitmap: Bitmap): Double {
-    if(isSolidColor(bitmap, 0.3f)) {
+    if(isSolidColor(bitmap, 0.3f, 10)) {
       return 0.0 // Solid color images are not considered dirty
     }
     val lapResult = computeLaplacianResult(bitmap)
