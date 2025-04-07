@@ -94,7 +94,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
-    val scaleFactor = 0.5f
+    val scaleFactor = 0.4f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -138,7 +138,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeGlobalContrastStdDev(bitmap: Bitmap): Double {
-    val scaleFactor = 0.5f
+    val scaleFactor = 0.4f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -157,7 +157,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
-    val scaleFactor = 0.5f
+    val scaleFactor = 0.4f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -195,7 +195,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeAverageBrightness(bitmap: Bitmap): Double {
-    val scaleFactor = 0.5f
+    val scaleFactor = 0.4f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
@@ -211,7 +211,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeTenengradScore(bitmap: Bitmap): Double {
-    val scaleFactor = 0.5f
+    val scaleFactor = 0.4f
     val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
     val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
     val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
