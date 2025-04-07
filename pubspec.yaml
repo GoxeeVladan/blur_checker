@@ -1,5 +1,5 @@
 name: blur_checker
-description: "A new Flutter project."
+description: "Simple plugin to check if the image is blurred or not"
 version: 0.0.1
 homepage:
 
