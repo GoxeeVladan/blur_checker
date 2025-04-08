@@ -3,6 +3,7 @@ package com.example.blur_checker
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.os.AsyncTask
 import android.util.Log
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -18,6 +19,10 @@ data class LaplacianResult(val stdDev: Double, val edgeCount: Int)
 
 class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   private lateinit var channel: MethodChannel
+  private val processingScaleFactor = 0.2f // Experiment with this value
+  private val nearSolidColorScaleFactor = 0.05f
+  private val nearSolidColorTolerance = 10
+  private val nearSolidColorSampleSize = 10
 
   override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel = MethodChannel(binding.binaryMessenger, "blur_checker_native")
@@ -28,25 +33,19 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     when (call.method) {
       "getLensDirtyScore" -> {
         val path = call.argument<String>("path")
-        val bitmap = BitmapFactory.decodeFile(File(path ?: "").absolutePath)
-
-        if (bitmap != null) {
-          val score = computeLensDirtyScore(bitmap)
-          result.success(score)
-        } else {
-          result.error("BITMAP_NULL", "Failed to decode image", null)
+        if (path == null) {
+          result.error("ARGUMENT_ERROR", "Path argument is required", null)
+          return
         }
+        ProcessImageTask(path, false, result, this).execute()
       }
       "isLensDirty" -> {
         val path = call.argument<String>("path")
-        val bitmap = BitmapFactory.decodeFile(File(path ?: "").absolutePath)
-
-        if (bitmap != null) {
-          val score = computeLensDirtyScore(bitmap)
-          result.success(score >= 0.7)
-        } else {
-          result.error("BITMAP_NULL", "Failed to decode image", null)
+        if (path == null) {
+          result.error("ARGUMENT_ERROR", "Path argument is required", null)
+          return
         }
+        ProcessImageTask(path, true, result, this).execute()
       }
       else -> result.notImplemented()
     }
@@ -56,24 +55,24 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     channel.setMethodCallHandler(null)
   }
 
-  private fun computeLensDirtyScore(bitmap: Bitmap): Double {
-    if(isSolidColor(bitmap, 0.3f)) {
-      return 0.0 // Solid color images are not considered dirty
+  private fun computeLensDirtyScore(scaledBitmap: Bitmap): Double {
+    if (isNearSolidColor(scaledBitmap, nearSolidColorTolerance, nearSolidColorSampleSize)) {
+      return 0.0
     }
-    val lapResult = computeLaplacianResult(bitmap)
+    val lapResult = computeLaplacianResult(scaledBitmap)
     val laplacianStd = lapResult.stdDev
-    val edgeCount = lapResult.edgeCount
-    val tenengrad = computeTenengradScore(bitmap)
-    val contrastStd = computeGlobalContrastStdDev(bitmap)
-    val brightness = computeAverageBrightness(bitmap)
-    val darkChannelVal = computeDarkChannelAverage(bitmap)
+    val tenengrad = computeTenengradScore(scaledBitmap)
+    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
+    val brightness = computeAverageBrightness(scaledBitmap)
+    val darkChannelVal = computeDarkChannelAverage(scaledBitmap)
+
     val laplacianScaled = (laplacianStd / 30.0).coerceIn(0.0, 1.5)
     val tenengradScaled = (tenengrad / 50.0).coerceIn(0.0, 1.0)
     val contrastScaled = (contrastStd / 50.0).coerceIn(0.0, 1.0)
     val darkChannelScaled = (darkChannelVal / 60.0).coerceIn(0.0, 2.0)
 
     val useTenengrad = (contrastStd < 15.0) || (brightness > 170) || (darkChannelVal > 35)
-    val blendFactor = if (useTenengrad) 0.7 else 0.3 // Weighted preference
+    val blendFactor = if (useTenengrad) 0.7 else 0.3
 
     val edgeFocusScore = (1.0 - ((blendFactor * tenengradScaled) + ((1 - blendFactor) * laplacianScaled)))
 
@@ -89,23 +88,17 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 
     val adjustedScore = dirtyScore * edgeWeightFactor
 
-    // Updated haze fallback logic
     val hazeTrigger = (darkChannelScaled > 0.7 && contrastStd < 15) || (darkChannelScaled > 1.0)
-    val finalScore = if (hazeTrigger && adjustedScore < 0.6) 0.75 else adjustedScore
-
-    return finalScore
+    return if (hazeTrigger && adjustedScore < 0.6) 0.75 else adjustedScore
   }
 
   private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
-    val scaleFactor = 0.3f
-    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
-    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
-
+    val w = bitmap.width
+    val h = bitmap.height
     val gray = Array(h) { IntArray(w) }
     for (y in 0 until h) {
       for (x in 0 until w) {
-        val p = scaled.getPixel(x, y)
+        val p = bitmap.getPixel(x, y)
         gray[y][x] = (0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)).toInt()
       }
     }
@@ -141,58 +134,71 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeGlobalContrastStdDev(bitmap: Bitmap): Double {
-    val scaleFactor = 0.3f
-    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
-    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
-
+    val w = bitmap.width
+    val h = bitmap.height
     val values = DoubleArray(w * h)
     var idx = 0
     for (y in 0 until h) {
       for (x in 0 until w) {
-        val p = scaled.getPixel(x, y)
+        val p = bitmap.getPixel(x, y)
         values[idx++] = 0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)
       }
     }
+    if (values.isEmpty()) return 0.0
     val mean = values.average()
     val variance = values.sumOf { (it - mean).pow(2) } / values.size
     return sqrt(variance)
   }
-  private fun isSolidColor(bitmap: Bitmap, scaleFactor: Float = 0.1f, tolerance: Int = 2): Boolean {
-    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
-    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
 
-    if (w * h <= 1) return true // Single pixel image is solid
+  private fun isNearSolidColor(bitmap: Bitmap, tolerance: Int, sampleSize: Int): Boolean {
+    val w = bitmap.width
+    val h = bitmap.height
+    if (w * h <= 1) return true
 
-    val firstPixel = scaled.getPixel(0, 0)
-    val firstRed = Color.red(firstPixel)
-    val firstGreen = Color.green(firstPixel)
-    val firstBlue = Color.blue(firstPixel)
+    val random = java.util.Random()
+    var avgRed = 0
+    var avgGreen = 0
+    var avgBlue = 0
 
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        val pixel = scaled.getPixel(x, y)
-        if (kotlin.math.abs(Color.red(pixel) - firstRed) > tolerance ||
-          kotlin.math.abs(Color.green(pixel) - firstGreen) > tolerance ||
-          kotlin.math.abs(Color.blue(pixel) - firstBlue) > tolerance) {
-          return false // Not a solid color
-        }
+    // Sample a few random pixels
+    for (i in 0 until minOf(sampleSize, w * h)) {
+      val x = random.nextInt(w)
+      val y = random.nextInt(h)
+      val pixel = bitmap.getPixel(x, y)
+      avgRed += Color.red(pixel)
+      avgGreen += Color.green(pixel)
+      avgBlue += Color.blue(pixel)
+    }
+
+    val sampleCount = minOf(sampleSize, w * h)
+    if (sampleCount == 0) return true // Avoid division by zero
+
+    avgRed /= sampleCount
+    avgGreen /= sampleCount
+    avgBlue /= sampleCount
+
+    // Check a larger sample against the average
+    val checkSampleSize = minOf(100, w * h) // Check more pixels for confirmation
+    for (i in 0 until checkSampleSize) {
+      val x = random.nextInt(w)
+      val y = random.nextInt(h)
+      val pixel = bitmap.getPixel(x, y)
+      if (kotlin.math.abs(Color.red(pixel) - avgRed) > tolerance ||
+        kotlin.math.abs(Color.green(pixel) - avgGreen) > tolerance ||
+        kotlin.math.abs(Color.blue(pixel) - avgBlue) > tolerance) {
+        return false
       }
     }
-    return true // All pixels are within the tolerance
+    return true
   }
 
   private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
-    val scaleFactor = 0.3f
-    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
-    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
-
+    val w = bitmap.width
+    val h = bitmap.height
     val darkChannel = Array(h) { IntArray(w) }
     for (y in 0 until h) {
       for (x in 0 until w) {
-        val p = scaled.getPixel(x, y)
+        val p = bitmap.getPixel(x, y)
         darkChannel[y][x] = minOf(Color.red(p), Color.green(p), Color.blue(p))
       }
     }
@@ -218,35 +224,29 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
         count++
       }
     }
-    return sum.toDouble() / count
+    return if (count > 0) sum.toDouble() / count else 0.0
   }
 
   private fun computeAverageBrightness(bitmap: Bitmap): Double {
-    val scaleFactor = 0.3f
-    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
-    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
-
+    val w = bitmap.width
+    val h = bitmap.height
     var total = 0.0
     for (y in 0 until h) {
       for (x in 0 until w) {
-        val p = scaled.getPixel(x, y)
+        val p = bitmap.getPixel(x, y)
         total += 0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)
       }
     }
-    return total / (w * h)
+    return if (w * h > 0) total / (w * h) else 0.0
   }
 
   private fun computeTenengradScore(bitmap: Bitmap): Double {
-    val scaleFactor = 0.3f
-    val w = (bitmap.width * scaleFactor).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * scaleFactor).toInt().coerceAtLeast(1)
-    val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
-
+    val w = bitmap.width
+    val h = bitmap.height
     val gray = Array(h) { IntArray(w) }
     for (y in 0 until h) {
       for (x in 0 until w) {
-        val p = scaled.getPixel(x, y)
+        val p = bitmap.getPixel(x, y)
         gray[y][x] = (0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)).toInt()
       }
     }
@@ -281,8 +281,39 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
         count++
       }
     }
-
-    return sum / count // average gradient magnitude
+    return if (count > 0) sum / count else 0.0
   }
 
+  private inner class ProcessImageTask(
+    private val path: String,
+    private val isLensDirtyCheck: Boolean,
+    private val result: MethodChannel.Result,
+    private val plugin: BlurCheckerPlugin
+  ) : AsyncTask<Void, Void, Any>() {
+
+    override fun doInBackground(vararg params: Void?): Any {
+      val bitmap = BitmapFactory.decodeFile(File(path).absolutePath)
+      return if (bitmap != null) {
+        val scaledBitmap = Bitmap.createScaledBitmap(
+          bitmap,
+          (bitmap.width * processingScaleFactor).toInt().coerceAtLeast(1),
+          (bitmap.height * processingScaleFactor).toInt().coerceAtLeast(1),
+          true
+        )
+        val score = plugin.computeLensDirtyScore(scaledBitmap)
+        scaledBitmap.recycle()
+        if (isLensDirtyCheck) score >= 0.7 else score
+      } else {
+        "BITMAP_NULL"
+      }
+    }
+
+    override fun onPostExecute(returnValue: Any) {
+      when (returnValue) {
+        is Double -> result.success(returnValue)
+        is Boolean -> result.success(returnValue)
+        is String -> result.error(returnValue, "Failed to decode image", null)
+      }
+    }
+  }
 }
