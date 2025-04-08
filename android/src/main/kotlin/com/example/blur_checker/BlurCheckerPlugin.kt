@@ -169,33 +169,33 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     return sqrt(variance)
   }
 
-  private fun isNearSolidColor(bitmap: Bitmap, tolerance: Int, sampleSize: Int): Boolean {
+  private fun isNearSolidColor(bitmap: Bitmap, tolerance: Int = 15, sampleSize: Int = 20): Boolean {
     val w = bitmap.width
     val h = bitmap.height
     if (w * h <= 1) return true
 
     val random = java.util.Random()
-    var avgRed = 0
-    var avgGreen = 0
-    var avgBlue = 0
+    var totalRed = 0
+    var totalGreen = 0
+    var totalBlue = 0
 
     for (i in 0 until minOf(sampleSize, w * h)) {
       val x = random.nextInt(w)
       val y = random.nextInt(h)
       val pixel = bitmap.getPixel(x, y)
-      avgRed += Color.red(pixel)
-      avgGreen += Color.green(pixel)
-      avgBlue += Color.blue(pixel)
+      totalRed += Color.red(pixel)
+      totalGreen += Color.green(pixel)
+      totalBlue += Color.blue(pixel)
     }
 
     val sampleCount = minOf(sampleSize, w * h)
     if (sampleCount == 0) return true
 
-    avgRed /= sampleCount
-    avgGreen /= sampleCount
-    avgBlue /= sampleCount
+    val avgRed = totalRed / sampleCount
+    val avgGreen = totalGreen / sampleCount
+    val avgBlue = totalBlue / sampleCount
 
-    val checkSampleSize = minOf(100, w * h)
+    val checkSampleSize = minOf(200, w * h) // Increased check sample
     for (i in 0 until checkSampleSize) {
       val x = random.nextInt(w)
       val y = random.nextInt(h)
