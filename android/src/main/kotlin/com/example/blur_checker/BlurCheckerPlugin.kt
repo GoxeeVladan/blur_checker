@@ -55,16 +55,35 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     channel.setMethodCallHandler(null)
   }
 
-  private fun computeLensDirtyScore(scaledBitmap: Bitmap): Double {
-    if (isNearSolidColor(scaledBitmap, nearSolidColorTolerance, nearSolidColorSampleSize)) {
+  private fun computeLensDirtyScore(originalBitmap: Bitmap): Double {
+    val scaledNearSolidBitmap = Bitmap.createScaledBitmap(
+      originalBitmap,
+      (originalBitmap.width * nearSolidColorScaleFactor).toInt().coerceAtLeast(1),
+      (originalBitmap.height * nearSolidColorScaleFactor).toInt().coerceAtLeast(1),
+      true
+    )
+
+    if (isNearSolidColor(scaledNearSolidBitmap, nearSolidColorTolerance, nearSolidColorSampleSize)) {
+      scaledNearSolidBitmap.recycle()
       return 0.0
     }
-    val lapResult = computeLaplacianResult(scaledBitmap)
+    scaledNearSolidBitmap.recycle()
+
+    val scaledProcessingBitmap = Bitmap.createScaledBitmap(
+      originalBitmap,
+      (originalBitmap.width * processingScaleFactor).toInt().coerceAtLeast(1),
+      (originalBitmap.height * processingScaleFactor).toInt().coerceAtLeast(1),
+      true
+    )
+
+    val lapResult = computeLaplacianResult(scaledProcessingBitmap)
     val laplacianStd = lapResult.stdDev
-    val tenengrad = computeTenengradScore(scaledBitmap)
-    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
-    val brightness = computeAverageBrightness(scaledBitmap)
-    val darkChannelVal = computeDarkChannelAverage(scaledBitmap)
+    val tenengrad = computeTenengradScore(scaledProcessingBitmap)
+    val contrastStd = computeGlobalContrastStdDev(scaledProcessingBitmap)
+    val brightness = computeAverageBrightness(scaledProcessingBitmap)
+    val darkChannelVal = computeDarkChannelAverage(scaledProcessingBitmap)
+
+    scaledProcessingBitmap.recycle()
 
     val laplacianScaled = (laplacianStd / 30.0).coerceIn(0.0, 1.5)
     val tenengradScaled = (tenengrad / 50.0).coerceIn(0.0, 1.0)
@@ -160,7 +179,6 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     var avgGreen = 0
     var avgBlue = 0
 
-    // Sample a few random pixels
     for (i in 0 until minOf(sampleSize, w * h)) {
       val x = random.nextInt(w)
       val y = random.nextInt(h)
@@ -171,14 +189,13 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     }
 
     val sampleCount = minOf(sampleSize, w * h)
-    if (sampleCount == 0) return true // Avoid division by zero
+    if (sampleCount == 0) return true
 
     avgRed /= sampleCount
     avgGreen /= sampleCount
     avgBlue /= sampleCount
 
-    // Check a larger sample against the average
-    val checkSampleSize = minOf(100, w * h) // Check more pixels for confirmation
+    val checkSampleSize = minOf(100, w * h)
     for (i in 0 until checkSampleSize) {
       val x = random.nextInt(w)
       val y = random.nextInt(h)
