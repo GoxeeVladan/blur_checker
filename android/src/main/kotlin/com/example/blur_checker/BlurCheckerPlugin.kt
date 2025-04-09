@@ -63,8 +63,9 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
       true
     )
 
-    if (isNearSolidColor(scaledNearSolidBitmap, nearSolidColorTolerance, nearSolidColorSampleSize)) {
+    if (isSolidColor(scaledNearSolidBitmap)) {
       scaledNearSolidBitmap.recycle()
+      Log.d("LensCheck", "Image is solid color — returning 0.0")
       return 0.0
     }
     scaledNearSolidBitmap.recycle()
@@ -78,6 +79,13 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 
     val lapResult = computeLaplacianResult(scaledProcessingBitmap)
     val laplacianStd = lapResult.stdDev
+
+    if (lapResult.edgeCount < 10 && computeGlobalContrastStdDev(scaledProcessingBitmap) < 5.0) {
+      Log.d("LensCheck", "Low edge + low contrast — likely solid color — returning 0.0")
+      scaledProcessingBitmap.recycle()
+      return 0.0
+    }
+
     val tenengrad = computeTenengradScore(scaledProcessingBitmap)
     val contrastStd = computeGlobalContrastStdDev(scaledProcessingBitmap)
     val brightness = computeAverageBrightness(scaledProcessingBitmap)
@@ -169,44 +177,63 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     return sqrt(variance)
   }
 
-  private fun isNearSolidColor(bitmap: Bitmap, tolerance: Int = 15, sampleSize: Int = 20): Boolean {
+//  private fun isNearSolidColor(bitmap: Bitmap, tolerance: Int = 15, sampleSize: Int = 20): Boolean {
+//    val w = bitmap.width
+//    val h = bitmap.height
+//    if (w * h <= 1) return true
+//
+//    val random = java.util.Random()
+//    var totalRed = 0
+//    var totalGreen = 0
+//    var totalBlue = 0
+//
+//    for (i in 0 until minOf(sampleSize, w * h)) {
+//      val x = random.nextInt(w)
+//      val y = random.nextInt(h)
+//      val pixel = bitmap.getPixel(x, y)
+//      totalRed += Color.red(pixel)
+//      totalGreen += Color.green(pixel)
+//      totalBlue += Color.blue(pixel)
+//    }
+//
+//    val sampleCount = minOf(sampleSize, w * h)
+//    if (sampleCount == 0) return true
+//
+//    val avgRed = totalRed / sampleCount
+//    val avgGreen = totalGreen / sampleCount
+//    val avgBlue = totalBlue / sampleCount
+//
+//    val checkSampleSize = minOf(200, w * h) // Increased check sample
+//    for (i in 0 until checkSampleSize) {
+//      val x = random.nextInt(w)
+//      val y = random.nextInt(h)
+//      val pixel = bitmap.getPixel(x, y)
+//      if (kotlin.math.abs(Color.red(pixel) - avgRed) > tolerance ||
+//        kotlin.math.abs(Color.green(pixel) - avgGreen) > tolerance ||
+//        kotlin.math.abs(Color.blue(pixel) - avgBlue) > tolerance) {
+//        return false
+//      }
+//    }
+//    return true
+//  }
+
+  private fun isSolidColor(bitmap: Bitmap, colorStdThreshold: Double = 5.0): Boolean {
     val w = bitmap.width
     val h = bitmap.height
-    if (w * h <= 1) return true
+    val pixelValues = DoubleArray(w * h)
+    var idx = 0
 
-    val random = java.util.Random()
-    var totalRed = 0
-    var totalGreen = 0
-    var totalBlue = 0
-
-    for (i in 0 until minOf(sampleSize, w * h)) {
-      val x = random.nextInt(w)
-      val y = random.nextInt(h)
-      val pixel = bitmap.getPixel(x, y)
-      totalRed += Color.red(pixel)
-      totalGreen += Color.green(pixel)
-      totalBlue += Color.blue(pixel)
-    }
-
-    val sampleCount = minOf(sampleSize, w * h)
-    if (sampleCount == 0) return true
-
-    val avgRed = totalRed / sampleCount
-    val avgGreen = totalGreen / sampleCount
-    val avgBlue = totalBlue / sampleCount
-
-    val checkSampleSize = minOf(200, w * h) // Increased check sample
-    for (i in 0 until checkSampleSize) {
-      val x = random.nextInt(w)
-      val y = random.nextInt(h)
-      val pixel = bitmap.getPixel(x, y)
-      if (kotlin.math.abs(Color.red(pixel) - avgRed) > tolerance ||
-        kotlin.math.abs(Color.green(pixel) - avgGreen) > tolerance ||
-        kotlin.math.abs(Color.blue(pixel) - avgBlue) > tolerance) {
-        return false
+    for (y in 0 until h) {
+      for (x in 0 until w) {
+        val pixel = bitmap.getPixel(x, y)
+        val brightness = 0.299 * Color.red(pixel) + 0.587 * Color.green(pixel) + 0.114 * Color.blue(pixel)
+        pixelValues[idx++] = brightness
       }
     }
-    return true
+
+    val mean = pixelValues.average()
+    val stdDev = sqrt(pixelValues.sumOf { (it - mean).pow(2) } / pixelValues.size)
+    return stdDev < colorStdThreshold
   }
 
   private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
