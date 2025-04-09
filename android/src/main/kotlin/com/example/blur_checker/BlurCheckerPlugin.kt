@@ -56,22 +56,6 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun computeLensDirtyScore(originalBitmap: Bitmap): Double {
-    // STEP 1: Fast early-out for solid-color scenes
-    val solidCheckBitmap = Bitmap.createScaledBitmap(
-      originalBitmap,
-      (originalBitmap.width * nearSolidColorScaleFactor).toInt().coerceAtLeast(1),
-      (originalBitmap.height * nearSolidColorScaleFactor).toInt().coerceAtLeast(1),
-      true
-    )
-
-    if (isMostlySolid(solidCheckBitmap)) {
-      solidCheckBitmap.recycle()
-      Log.d("LensCheck", "Image is mostly solid — clean")
-      return 0.0
-    }
-    solidCheckBitmap.recycle()
-
-    // STEP 2: Downscale for processing
     val scaledBitmap = Bitmap.createScaledBitmap(
       originalBitmap,
       (originalBitmap.width * processingScaleFactor).toInt().coerceAtLeast(1),
@@ -79,59 +63,50 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
       true
     )
 
-    // STEP 3: Compute core metrics
-    val lapResult = computeLaplacianResult(scaledBitmap)
-    val laplacianStd = lapResult.stdDev
-    val tenengrad = computeTenengradScore(scaledBitmap)
-    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
-    val brightness = computeAverageBrightness(scaledBitmap)
-    val darkChannelVal = computeDarkChannelAverage(scaledBitmap)
-    scaledBitmap.recycle()
-
-    // STEP 4: Low-detail + low-contrast fallback
-    if (lapResult.edgeCount < 10 && contrastStd < 5.0) {
-      Log.d("LensCheck", "Low edge and contrast — clean")
+    // Early exit for solid or mostly solid images (UI, backgrounds, clean screens)
+    if (isMostlySolid(scaledBitmap)) {
+      scaledBitmap.recycle()
+      Log.d("LensCheck", "Image is mostly solid — returning 0.0")
       return 0.0
     }
 
-    // STEP 5: Normalize metrics
+    val lapResult = computeLaplacianResult(scaledBitmap)
+    val laplacianStd = lapResult.stdDev
+    val edgeCount = lapResult.edgeCount
+    val tenengrad = computeTenengradScore(scaledBitmap)
+    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
+    val brightness = computeAverageBrightness(scaledBitmap)
+    val darkChannel = computeDarkChannelAverage(scaledBitmap)
+
+    scaledBitmap.recycle()
+
+    // Normalize feature values
     val laplacianScaled = (laplacianStd / 30.0).coerceIn(0.0, 1.5)
     val tenengradScaled = (tenengrad / 50.0).coerceIn(0.0, 1.0)
     val contrastScaled = (contrastStd / 50.0).coerceIn(0.0, 1.0)
-    val darkChannelScaled = (darkChannelVal / 60.0).coerceIn(0.0, 2.0)
+    val darkChannelScaled = (darkChannel / 60.0).coerceIn(0.0, 2.0)
 
-    // STEP 6: Choose blend between Tenengrad and Laplacian depending on scene
-    val useTenengrad = (contrastStd < 15.0) || (brightness > 170) || (darkChannelVal > 35)
+    // Switch to Tenengrad more heavily if contrast is low or image is bright
+    val useTenengrad = (contrastStd < 15.0) || (brightness > 170) || (darkChannel > 35)
     val blendFactor = if (useTenengrad) 0.7 else 0.3
+
     val edgeFocusScore = 1.0 - ((blendFactor * tenengradScaled) + ((1 - blendFactor) * laplacianScaled))
 
-    // STEP 7: Compensate for very bright, flat images (e.g., white screen)
-    val brightnessPenalty = if (brightness > 220 && darkChannelVal < 15 && contrastStd > 10) 0.5 else 1.0
+    val dirtyScore = (0.4 * darkChannelScaled) +
+            (0.35 * (1.0 - contrastScaled)) +
+            (0.25 * edgeFocusScore)
 
-    // STEP 8: Core dirty score computation
-    val baseDirtyScore = brightnessPenalty * (
-            (0.4 * darkChannelScaled) +
-                    (0.35 * (1.0 - contrastScaled)) +
-                    (0.25 * edgeFocusScore)
-            )
-
-    // STEP 9: Adjust score based on edge presence
+    // Adjust based on edge strength
     val edgeWeightFactor = when {
       edgeFocusScore > 0.8 -> 0.5
       edgeFocusScore < 0.3 -> 0.85
       else -> 1.0
     }
 
-    val adjustedScore = baseDirtyScore * edgeWeightFactor
+    val adjustedScore = dirtyScore * edgeWeightFactor
 
-    // STEP 10: Haze-specific trigger (still allow fallback threshold)
     val hazeTrigger = (darkChannelScaled > 0.7 && contrastStd < 15) || (darkChannelScaled > 1.0)
-    val finalScore = if (hazeTrigger && adjustedScore < 0.6) 0.75 else adjustedScore
-
-    Log.d("LensCheck", "Score: %.2f | Lap: %.2f, Ten: %.2f, Contrast: %.2f, Bright: %.2f, Dark: %.2f"
-      .format(finalScore, laplacianStd, tenengrad, contrastStd, brightness, darkChannelVal))
-
-    return finalScore.coerceIn(0.0, 1.0)
+    return if (hazeTrigger && adjustedScore < 0.6) 0.75 else adjustedScore
   }
 
   private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
@@ -232,34 +207,28 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 //    return true
 //  }
 
-  private fun isMostlySolid(bitmap: Bitmap, tolerance: Int = 10, sampleSize: Int = 10, solidRatioThreshold: Double = 0.75): Boolean {
-    val blockSize = 32 // size of the grid blocks
-    val w = bitmap.width
-    val h = bitmap.height
+  private fun isMostlySolid(bitmap: Bitmap, threshold: Int = 10): Boolean {
+    val width = bitmap.width
+    val height = bitmap.height
+    val pixels = IntArray(width * height)
+    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
-    val blockCols = (w + blockSize - 1) / blockSize
-    val blockRows = (h + blockSize - 1) / blockSize
+    val baseColor = pixels[0]
+    val r0 = (baseColor shr 16) and 0xFF
+    val g0 = (baseColor shr 8) and 0xFF
+    val b0 = baseColor and 0xFF
 
-    var solidBlockCount = 0
-    var totalBlockCount = 0
-
-    for (row in 0 until blockRows) {
-      for (col in 0 until blockCols) {
-        val startX = col * blockSize
-        val startY = row * blockSize
-        val endX = minOf(startX + blockSize, w)
-        val endY = minOf(startY + blockSize, h)
-
-        if (isBlockSolid(bitmap, startX, startY, endX, endY, tolerance, sampleSize)) {
-          solidBlockCount++
-        }
-
-        totalBlockCount++
-      }
+    var totalDiff = 0L
+    for (i in 1 until pixels.size) {
+      val p = pixels[i]
+      val r = (p shr 16) and 0xFF
+      val g = (p shr 8) and 0xFF
+      val b = p and 0xFF
+      totalDiff += Math.abs(r - r0) + Math.abs(g - g0) + Math.abs(b - b0)
     }
 
-    val ratio = if (totalBlockCount > 0) solidBlockCount.toDouble() / totalBlockCount else 0.0
-    return ratio >= solidRatioThreshold
+    val avgDiff = totalDiff / pixels.size
+    return avgDiff < threshold
   }
 
   private fun isBlockSolid(bitmap: Bitmap, startX: Int, startY: Int, endX: Int, endY: Int, tolerance: Int, sampleSize: Int): Boolean {
