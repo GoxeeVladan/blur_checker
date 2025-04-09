@@ -1,3 +1,4 @@
+// blur_checker/android/src/main/kotlin/com/example/blur_checker/BlurCheckerPlugin.kt
 package com.example.blur_checker
 
 import android.graphics.Bitmap
@@ -17,12 +18,263 @@ import kotlin.math.sqrt
 
 data class LaplacianResult(val stdDev: Double, val edgeCount: Int)
 
+object BlurCheckerUtils {
+  private const val PROCESSING_SCALE_FACTOR = 0.2
+  private const val MOSTLY_SOLID_THRESHOLD = 5
+  private const val MOSTLY_SOLID_SAMPLE_RATIO = 0.3
+  private const val LAPLACIAN_KERNEL_SIZE = 3
+  private val LAPLACIAN_KERNEL = arrayOf(
+    intArrayOf(0, -1, 0),
+    intArrayOf(-1, 4, -1),
+    intArrayOf(0, -1, 0)
+  )
+  private const val SOBEL_KERNEL_SIZE = 3
+  private val SOBEL_X_KERNEL = arrayOf(
+    intArrayOf(-1, 0, 1),
+    intArrayOf(-2, 0, 2),
+    intArrayOf(-1, 0, 1)
+  )
+  private val SOBEL_Y_KERNEL = arrayOf(
+    intArrayOf(1, 2, 1),
+    intArrayOf(0, 0, 0),
+    intArrayOf(-1, -2, -1)
+  )
+  private const val DARK_CHANNEL_PATCH_SIZE = 7
+
+  fun computeLensDirtyScore(originalBitmap: Bitmap): Double {
+    val scaledBitmap = scaleBitmap(originalBitmap, PROCESSING_SCALE_FACTOR)
+
+    if (isMostlySolid(scaledBitmap, MOSTLY_SOLID_THRESHOLD, MOSTLY_SOLID_SAMPLE_RATIO)) {
+      scaledBitmap.recycle()
+      Log.d("LensCheck", "Image is mostly solid — returning 0.0")
+      return 0.0
+    }
+
+    val lapResult = computeLaplacianResult(scaledBitmap)
+    val laplacianStd = lapResult.stdDev
+    val tenengrad = computeTenengradScore(scaledBitmap)
+    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
+    val brightness = computeAverageBrightness(scaledBitmap)
+    val darkChannelAvg = computeDarkChannelAverage(scaledBitmap)
+
+    scaledBitmap.recycle()
+
+    // Normalized feature values with more conservative clamping
+    val laplacianScaled = (laplacianStd / 30.0).coerceIn(0.0, 1.2)
+    val tenengradScaled = (tenengrad / 50.0).coerceIn(0.0, 0.9)
+    val contrastScaled = (contrastStd / 50.0).coerceIn(0.0, 0.9)
+    val darkChannelScaled = (darkChannelAvg / 60.0).coerceIn(0.0, 1.3)
+
+    // Adjust useTenengrad logic - consider contrast more strongly
+    val useTenengrad = (contrastStd < 18.0) || (brightness > 160) || (darkChannelAvg > 30)
+    val blendFactor = if (useTenengrad) 0.7 else 0.3
+
+    val edgeFocusScore = 1.0 - ((blendFactor * tenengradScaled) + ((1 - blendFactor) * laplacianScaled))
+
+    var dirtyScore = (0.4 * darkChannelScaled) +
+            (0.35 * (1.0 - contrastScaled)) +
+            (0.25 * edgeFocusScore)
+
+    // Reduce impact of dark channel if contrast is very low
+    if (contrastStd < 8.0) {
+      dirtyScore -= 0.3 * darkChannelScaled.coerceAtMost(0.6)
+      dirtyScore = dirtyScore.coerceAtLeast(0.0)
+    }
+
+    // Adjust based on edge strength
+    val edgeWeightFactor = when {
+      edgeFocusScore > 0.8 -> 0.5
+      edgeFocusScore < 0.3 -> 0.85
+      else -> 1.0
+    }
+
+    val adjustedScore = dirtyScore * edgeWeightFactor
+
+    val hazeTrigger = (darkChannelScaled > 0.6 && contrastStd < 16) || (darkChannelScaled > 1.0)
+    return if (hazeTrigger && adjustedScore < 0.65) 0.70 else adjustedScore
+  }
+
+  private fun scaleBitmap(bitmap: Bitmap, factor: Double): Bitmap {
+    return Bitmap.createScaledBitmap(
+      bitmap,
+      (bitmap.width * factor).toInt().coerceAtLeast(1),
+      (bitmap.height * factor).toInt().coerceAtLeast(1),
+      true
+    )
+  }
+
+  private fun isMostlySolid(bitmap: Bitmap, threshold: Int, sampleRatio: Double): Boolean {
+    val width = bitmap.width
+    val height = bitmap.height
+    val numPixels = width * height
+    if (numPixels <= 1) return true
+
+    val numSamples = (numPixels * sampleRatio).toInt().coerceAtLeast(50)
+    val pixels = IntArray(numSamples)
+    val random = java.util.Random()
+
+    val baseColor = bitmap.getPixel(random.nextInt(width), random.nextInt(height))
+    val r0 = Color.red(baseColor)
+    val g0 = Color.green(baseColor)
+    val b0 = Color.blue(baseColor)
+
+    var totalDiff = 0L
+    for (i in 0 until numSamples) {
+      val x = random.nextInt(width)
+      val y = random.nextInt(height)
+      val p = bitmap.getPixel(x, y)
+      totalDiff += kotlin.math.abs(Color.red(p) - r0) +
+              kotlin.math.abs(Color.green(p) - g0) +
+              kotlin.math.abs(Color.blue(p) - b0)
+    }
+
+    val avgDiff = totalDiff.toDouble() / numSamples
+    return avgDiff < threshold
+  }
+
+  private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
+    val width = bitmap.width
+    val height = bitmap.height
+    if (width < LAPLACIAN_KERNEL_SIZE || height < LAPLACIAN_KERNEL_SIZE) {
+      return LaplacianResult(0.0, 0)
+    }
+
+    val gray = Array(height) { IntArray(width) }
+    for (y in 0 until height) {
+      for (x in 0 until width) {
+        gray[y][x] = (Color.luminance(bitmap.getPixel(x, y)) * 255).toInt()
+      }
+    }
+
+    var sum = 0.0
+    var sumSq = 0.0
+    var count = 0
+    var strongEdgeCount = 0
+    val edgeThreshold = 20
+
+    for (y in 1 until height - 1) {
+      for (x in 1 until width - 1) {
+        var laplacianValue = 0
+        for (ky in -1..1) {
+          for (kx in -1..1) {
+            laplacianValue += gray[y + ky][x + kx] * LAPLACIAN_KERNEL[ky + 1][kx + 1]
+          }
+        }
+        val v = laplacianValue.toDouble()
+        sum += v
+        sumSq += v * v
+        if (kotlin.math.abs(v) > edgeThreshold) strongEdgeCount++
+        count++
+      }
+    }
+
+    val variance = if (count > 0) (sumSq / count) - (sum / count).pow(2) else 0.0
+    return LaplacianResult(sqrt(variance.coerceAtLeast(0.0)), strongEdgeCount)
+  }
+
+  private fun computeGlobalContrastStdDev(bitmap: Bitmap): Double {
+    val width = bitmap.width
+    val height = bitmap.height
+    val luminanceValues = DoubleArray(width * height)
+    for (y in 0 until height) {
+      for (x in 0 until width) {
+        luminanceValues[y * width + x] = Color.luminance(bitmap.getPixel(x, y)).toDouble()
+      }
+    }
+    if (luminanceValues.isEmpty()) return 0.0
+    val mean = luminanceValues.average()
+    val variance = luminanceValues.sumOf { (it - mean).pow(2) } / luminanceValues.size
+    return sqrt(variance)
+  }
+
+  private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
+    val width = bitmap.width
+    val height = bitmap.height
+    if (width < DARK_CHANNEL_PATCH_SIZE || height < DARK_CHANNEL_PATCH_SIZE) {
+      var minVal = 255
+      for (y in 0 until height) {
+        for (x in 0 until width) {
+          val pixel = bitmap.getPixel(x, y)
+          minVal = minOf(Color.red(pixel), Color.green(pixel), Color.blue(pixel), minVal)
+        }
+      }
+      return minVal.toDouble()
+    }
+
+    val pad = DARK_CHANNEL_PATCH_SIZE / 2
+    var sum = 0
+    var count = 0
+
+    for (y in 0 until height) {
+      for (x in 0 until width) {
+        var localMin = 255
+        for (dy in -pad..pad) {
+          for (dx in -pad..pad) {
+            val ny = y + dy
+            val nx = x + dx
+            if (ny in 0 until height && nx in 0 until width) {
+              val pixel = bitmap.getPixel(nx, ny)
+              localMin = minOf(Color.red(pixel), Color.green(pixel), Color.blue(pixel), localMin)
+            }
+          }
+        }
+        sum += localMin
+        count++
+      }
+    }
+    return if (count > 0) sum.toDouble() / count else 0.0
+  }
+
+  private fun computeAverageBrightness(bitmap: Bitmap): Double {
+    val width = bitmap.width
+    val height = bitmap.height
+    var totalLuminance = 0.0
+    for (y in 0 until height) {
+      for (x in 0 until width) {
+        totalLuminance += Color.luminance(bitmap.getPixel(x, y))
+      }
+    }
+    return if (width * height > 0) (totalLuminance / (width * height)) * 255 else 0.0
+  }
+
+  private fun computeTenengradScore(bitmap: Bitmap): Double {
+    val width = bitmap.width
+    val height = bitmap.height
+    if (width < SOBEL_KERNEL_SIZE || height < SOBEL_KERNEL_SIZE) {
+      return 0.0
+    }
+
+    val gray = Array(height) { IntArray(width) }
+    for (y in 0 until height) {
+      for (x in 0 until width) {
+        gray[y][x] = (Color.luminance(bitmap.getPixel(x, y)) * 255).toInt()
+      }
+    }
+
+    var sumMagnitude = 0.0
+    var count = 0
+
+    for (y in 1 until height - 1) {
+      for (x in 1 until width - 1) {
+        var gx = 0
+        var gy = 0
+        for (ky in -1..1) {
+          for (kx in -1..1) {
+            val pixelValue = gray[y + ky][x + kx]
+            gx += pixelValue * SOBEL_X_KERNEL[ky + 1][kx + 1]
+            gy += pixelValue * SOBEL_Y_KERNEL[ky + 1][kx + 1]
+          }
+        }
+        sumMagnitude += sqrt((gx * gx + gy * gy).toDouble())
+        count++
+      }
+    }
+    return if (count > 0) sumMagnitude / count else 0.0
+  }
+}
+
 class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   private lateinit var channel: MethodChannel
-  private val processingScaleFactor = 0.2f // Experiment with this value
-  private val nearSolidColorScaleFactor = 0.05f
-  private val nearSolidColorTolerance = 10
-  private val nearSolidColorSampleSize = 10
 
   override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel = MethodChannel(binding.binaryMessenger, "blur_checker_native")
@@ -37,16 +289,18 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
           result.error("ARGUMENT_ERROR", "Path argument is required", null)
           return
         }
-        ProcessImageTask(path, false, result, this).execute()
+        ProcessImageTask(path, false, result).execute()
       }
+
       "isLensDirty" -> {
         val path = call.argument<String>("path")
         if (path == null) {
           result.error("ARGUMENT_ERROR", "Path argument is required", null)
           return
         }
-        ProcessImageTask(path, true, result, this).execute()
+        ProcessImageTask(path, true, result).execute()
       }
+
       else -> result.notImplemented()
     }
   }
@@ -55,341 +309,65 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
     channel.setMethodCallHandler(null)
   }
 
-  private fun computeLensDirtyScore(originalBitmap: Bitmap): Double {
-    val scaledBitmap = Bitmap.createScaledBitmap(
-      originalBitmap,
-      (originalBitmap.width * processingScaleFactor).toInt().coerceAtLeast(1),
-      (originalBitmap.height * processingScaleFactor).toInt().coerceAtLeast(1),
-      true
-    )
-
-    // Early exit for solid or mostly solid images (UI, backgrounds, clean screens)
-    if (isMostlySolid(scaledBitmap)) {
-      scaledBitmap.recycle()
-      Log.d("LensCheck", "Image is mostly solid — returning 0.0")
-      return 0.0
-    }
-
-    val lapResult = computeLaplacianResult(scaledBitmap)
-    val laplacianStd = lapResult.stdDev
-    val edgeCount = lapResult.edgeCount
-    val tenengrad = computeTenengradScore(scaledBitmap)
-    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
-    val brightness = computeAverageBrightness(scaledBitmap)
-    val darkChannel = computeDarkChannelAverage(scaledBitmap)
-
-    scaledBitmap.recycle()
-
-    // Normalize feature values
-    val laplacianScaled = (laplacianStd / 30.0).coerceIn(0.0, 1.5)
-    val tenengradScaled = (tenengrad / 50.0).coerceIn(0.0, 1.0)
-    val contrastScaled = (contrastStd / 50.0).coerceIn(0.0, 1.0)
-    val darkChannelScaled = (darkChannel / 60.0).coerceIn(0.0, 2.0)
-
-    // Switch to Tenengrad more heavily if contrast is low or image is bright
-    val useTenengrad = (contrastStd < 15.0) || (brightness > 170) || (darkChannel > 35)
-    val blendFactor = if (useTenengrad) 0.7 else 0.3
-
-    val edgeFocusScore = 1.0 - ((blendFactor * tenengradScaled) + ((1 - blendFactor) * laplacianScaled))
-
-    val dirtyScore = (0.4 * darkChannelScaled) +
-            (0.35 * (1.0 - contrastScaled)) +
-            (0.25 * edgeFocusScore)
-
-    // Adjust based on edge strength
-    val edgeWeightFactor = when {
-      edgeFocusScore > 0.8 -> 0.5
-      edgeFocusScore < 0.3 -> 0.85
-      else -> 1.0
-    }
-
-    val adjustedScore = dirtyScore * edgeWeightFactor
-
-    val hazeTrigger = (darkChannelScaled > 0.7 && contrastStd < 15) || (darkChannelScaled > 1.0)
-    return if (hazeTrigger && adjustedScore < 0.6) 0.75 else adjustedScore
-  }
-
-  private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
-    val w = bitmap.width
-    val h = bitmap.height
-    val gray = Array(h) { IntArray(w) }
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        val p = bitmap.getPixel(x, y)
-        gray[y][x] = (0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)).toInt()
-      }
-    }
-
-    val kernel = arrayOf(
-      intArrayOf(0, -1, 0),
-      intArrayOf(-1, 4, -1),
-      intArrayOf(0, -1, 0)
-    )
-
-    var sum = 0.0
-    var sumSq = 0.0
-    var count = 0
-    var strongEdgeCount = 0
-
-    for (y in 1 until h - 1) {
-      for (x in 1 until w - 1) {
-        var lap = 0
-        for (ky in -1..1) {
-          for (kx in -1..1) {
-            lap += gray[y + ky][x + kx] * kernel[ky + 1][kx + 1]
-          }
-        }
-        val v = lap.toDouble()
-        sum += v
-        sumSq += v * v
-        if (kotlin.math.abs(v) > 15) strongEdgeCount++
-        count++
-      }
-    }
-    val variance = if (count > 0) (sumSq / count) - (sum / count).pow(2) else 0.0
-    return LaplacianResult(sqrt(variance.coerceAtLeast(0.0)), strongEdgeCount)
-  }
-
-  private fun computeGlobalContrastStdDev(bitmap: Bitmap): Double {
-    val w = bitmap.width
-    val h = bitmap.height
-    val values = DoubleArray(w * h)
-    var idx = 0
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        val p = bitmap.getPixel(x, y)
-        values[idx++] = 0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)
-      }
-    }
-    if (values.isEmpty()) return 0.0
-    val mean = values.average()
-    val variance = values.sumOf { (it - mean).pow(2) } / values.size
-    return sqrt(variance)
-  }
-
-//  private fun isNearSolidColor(bitmap: Bitmap, tolerance: Int = 15, sampleSize: Int = 20): Boolean {
-//    val w = bitmap.width
-//    val h = bitmap.height
-//    if (w * h <= 1) return true
-//
-//    val random = java.util.Random()
-//    var totalRed = 0
-//    var totalGreen = 0
-//    var totalBlue = 0
-//
-//    for (i in 0 until minOf(sampleSize, w * h)) {
-//      val x = random.nextInt(w)
-//      val y = random.nextInt(h)
-//      val pixel = bitmap.getPixel(x, y)
-//      totalRed += Color.red(pixel)
-//      totalGreen += Color.green(pixel)
-//      totalBlue += Color.blue(pixel)
-//    }
-//
-//    val sampleCount = minOf(sampleSize, w * h)
-//    if (sampleCount == 0) return true
-//
-//    val avgRed = totalRed / sampleCount
-//    val avgGreen = totalGreen / sampleCount
-//    val avgBlue = totalBlue / sampleCount
-//
-//    val checkSampleSize = minOf(200, w * h) // Increased check sample
-//    for (i in 0 until checkSampleSize) {
-//      val x = random.nextInt(w)
-//      val y = random.nextInt(h)
-//      val pixel = bitmap.getPixel(x, y)
-//      if (kotlin.math.abs(Color.red(pixel) - avgRed) > tolerance ||
-//        kotlin.math.abs(Color.green(pixel) - avgGreen) > tolerance ||
-//        kotlin.math.abs(Color.blue(pixel) - avgBlue) > tolerance) {
-//        return false
-//      }
-//    }
-//    return true
-//  }
-
-  private fun isMostlySolid(bitmap: Bitmap, threshold: Int = 10): Boolean {
-    val width = bitmap.width
-    val height = bitmap.height
-    val pixels = IntArray(width * height)
-    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
-    val baseColor = pixels[0]
-    val r0 = (baseColor shr 16) and 0xFF
-    val g0 = (baseColor shr 8) and 0xFF
-    val b0 = baseColor and 0xFF
-
-    var totalDiff = 0L
-    for (i in 1 until pixels.size) {
-      val p = pixels[i]
-      val r = (p shr 16) and 0xFF
-      val g = (p shr 8) and 0xFF
-      val b = p and 0xFF
-      totalDiff += Math.abs(r - r0) + Math.abs(g - g0) + Math.abs(b - b0)
-    }
-
-    val avgDiff = totalDiff / pixels.size
-    return avgDiff < threshold
-  }
-
-  private fun isBlockSolid(bitmap: Bitmap, startX: Int, startY: Int, endX: Int, endY: Int, tolerance: Int, sampleSize: Int): Boolean {
-    val random = java.util.Random()
-    var totalRed = 0
-    var totalGreen = 0
-    var totalBlue = 0
-
-    val pixelCount = (endX - startX) * (endY - startY)
-    val samples = minOf(sampleSize, pixelCount)
-    if (samples <= 1) return true
-
-    for (i in 0 until samples) {
-      val x = startX + random.nextInt(endX - startX)
-      val y = startY + random.nextInt(endY - startY)
-      val pixel = bitmap.getPixel(x, y)
-      totalRed += Color.red(pixel)
-      totalGreen += Color.green(pixel)
-      totalBlue += Color.blue(pixel)
-    }
-
-    val avgRed = totalRed / samples
-    val avgGreen = totalGreen / samples
-    val avgBlue = totalBlue / samples
-
-    for (i in 0 until samples) {
-      val x = startX + random.nextInt(endX - startX)
-      val y = startY + random.nextInt(endY - startY)
-      val pixel = bitmap.getPixel(x, y)
-      if (kotlin.math.abs(Color.red(pixel) - avgRed) > tolerance ||
-        kotlin.math.abs(Color.green(pixel) - avgGreen) > tolerance ||
-        kotlin.math.abs(Color.blue(pixel) - avgBlue) > tolerance) {
-        return false
-      }
-    }
-    return true
-  }
-
-
-  private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
-    val w = bitmap.width
-    val h = bitmap.height
-    val darkChannel = Array(h) { IntArray(w) }
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        val p = bitmap.getPixel(x, y)
-        darkChannel[y][x] = minOf(Color.red(p), Color.green(p), Color.blue(p))
-      }
-    }
-
-    val patchSize = 7
-    val pad = patchSize / 2
-    var sum = 0L
-    var count = 0
-
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        var localMin = 255
-        for (dy in -pad..pad) {
-          for (dx in -pad..pad) {
-            val ny = y + dy
-            val nx = x + dx
-            if (ny in 0 until h && nx in 0 until w) {
-              localMin = minOf(localMin, darkChannel[ny][nx])
-            }
-          }
-        }
-        sum += localMin
-        count++
-      }
-    }
-    return if (count > 0) sum.toDouble() / count else 0.0
-  }
-
-  private fun computeAverageBrightness(bitmap: Bitmap): Double {
-    val w = bitmap.width
-    val h = bitmap.height
-    var total = 0.0
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        val p = bitmap.getPixel(x, y)
-        total += 0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)
-      }
-    }
-    return if (w * h > 0) total / (w * h) else 0.0
-  }
-
-  private fun computeTenengradScore(bitmap: Bitmap): Double {
-    val w = bitmap.width
-    val h = bitmap.height
-    val gray = Array(h) { IntArray(w) }
-    for (y in 0 until h) {
-      for (x in 0 until w) {
-        val p = bitmap.getPixel(x, y)
-        gray[y][x] = (0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)).toInt()
-      }
-    }
-
-    val sobelX = arrayOf(
-      intArrayOf(-1, 0, 1),
-      intArrayOf(-2, 0, 2),
-      intArrayOf(-1, 0, 1)
-    )
-    val sobelY = arrayOf(
-      intArrayOf(1, 2, 1),
-      intArrayOf(0, 0, 0),
-      intArrayOf(-1, -2, -1)
-    )
-
-    var sum = 0.0
-    var count = 0
-
-    for (y in 1 until h - 1) {
-      for (x in 1 until w - 1) {
-        var gx = 0
-        var gy = 0
-        for (ky in -1..1) {
-          for (kx in -1..1) {
-            val px = gray[y + ky][x + kx]
-            gx += px * sobelX[ky + 1][kx + 1]
-            gy += px * sobelY[ky + 1][kx + 1]
-          }
-        }
-        val magnitude = sqrt((gx * gx + gy * gy).toDouble())
-        sum += magnitude
-        count++
-      }
-    }
-    return if (count > 0) sum / count else 0.0
-  }
-
   private inner class ProcessImageTask(
     private val path: String,
     private val isLensDirtyCheck: Boolean,
-    private val result: MethodChannel.Result,
-    private val plugin: BlurCheckerPlugin
-  ) : AsyncTask<Void, Void, Any>() {
+    private val result: MethodChannel.Result
+  ) : AsyncTask<Void, Void, Any?>() {
 
-    override fun doInBackground(vararg params: Void?): Any {
-      val bitmap = BitmapFactory.decodeFile(File(path).absolutePath)
-      return if (bitmap != null) {
-        val scaledBitmap = Bitmap.createScaledBitmap(
-          bitmap,
-          (bitmap.width * processingScaleFactor).toInt().coerceAtLeast(1),
-          (bitmap.height * processingScaleFactor).toInt().coerceAtLeast(1),
-          true
-        )
-        val score = plugin.computeLensDirtyScore(scaledBitmap)
-        scaledBitmap.recycle()
-        if (isLensDirtyCheck) score >= 0.7 else score
-      } else {
-        "BITMAP_NULL"
+    override fun doInBackground(vararg params: Void?): Any? {
+      val path = File(path).absolutePath
+      val bitmap = decodeSampledBitmap(path, 512, 512) // Example: Target 512x512
+      if (bitmap == null) {
+        return "BITMAP_NULL"
       }
+
+      val score = BlurCheckerUtils.computeLensDirtyScore(bitmap)
+      bitmap.recycle()
+      return if (isLensDirtyCheck) score >= 0.7 else score
     }
 
-    override fun onPostExecute(returnValue: Any) {
+    override fun onPostExecute(returnValue: Any?) {
       when (returnValue) {
         is Double -> result.success(returnValue)
         is Boolean -> result.success(returnValue)
         is String -> result.error(returnValue, "Failed to decode image", null)
+        null -> result.error("NULL_RESULT", "Image processing failed", null)
       }
+    }
+
+    private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+      // First decode with inJustDecodeBounds=true to check dimensions
+      val options = BitmapFactory.Options()
+      options.inJustDecodeBounds = true
+      BitmapFactory.decodeFile(path, options)
+
+      // Calculate inSampleSize
+      options.inSampleSize = calculateInSampleSize(options, reqWidth, reqHeight)
+
+      // Decode bitmap with inSampleSize set
+      options.inJustDecodeBounds = false
+      return BitmapFactory.decodeFile(path, options)
+    }
+
+    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
+      // Raw height and width of image
+      val height = options.outHeight
+      val width = options.outWidth
+      var inSampleSize = 1
+
+      if (height > reqHeight || width > reqWidth) {
+        val halfHeight = height / 2
+        val halfWidth = width / 2
+
+        // Calculate the largest inSampleSize value that is a power of 2 and keeps both
+        // height and width larger than the requested height and width.
+        while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+          inSampleSize *= 2
+        }
+      }
+
+      return inSampleSize
     }
   }
 }
