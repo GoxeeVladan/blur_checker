@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.os.AsyncTask
 import android.util.Log
 import androidx.annotation.NonNull
+import com.example.blur_checker.BlurCheckerUtils
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -317,7 +318,7 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 
     override fun doInBackground(vararg params: Void?): Any? {
       val path = File(path).absolutePath
-      val bitmap = decodeSampledBitmap(path, 512, 512) // Example: Target 512x512
+      val bitmap = decodeSampledBitmap(path, 640, 640) // Example: Target 512x512
       if (bitmap == null) {
         return "BITMAP_NULL"
       }
