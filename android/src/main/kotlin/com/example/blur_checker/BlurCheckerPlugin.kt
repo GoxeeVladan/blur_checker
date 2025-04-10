@@ -318,10 +318,12 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 
     override fun doInBackground(vararg params: Void?): Any? {
       val path = File(path).absolutePath
-      val bitmap = decodeSampledBitmap(path, 640, 640) // Example: Target 512x512
+      var bitmap = decodeSampledBitmap(path, 640, 640) // Example: Target 640x640
       if (bitmap == null) {
         return "BITMAP_NULL"
       }
+
+      bitmap = applyGaussianBlur(bitmap, 3f) // Apply smoothing (adjust radius)
 
       val score = BlurCheckerUtils.computeLensDirtyScore(bitmap)
       bitmap.recycle()
@@ -369,6 +371,36 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
       }
 
       return inSampleSize
+    }
+    private fun applyGaussianBlur(source: Bitmap, radius: Float): Bitmap {
+      // Implementation of Gaussian blur (simplified example - consider RenderScript or NDK)
+      val width = source.width
+      val height = source.height
+      val blurredBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+      val canvas = android.graphics.Canvas(blurredBitmap)
+      val paint = android.graphics.Paint()
+      paint.flags = android.graphics.Paint.FILTER_BITMAP_FLAG
+      canvas.drawBitmap(source, 0f, 0f, paint) // Draw original
+
+      // Very basic averaging blur (replace with proper Gaussian)
+      for (x in 1 until width - 1) {
+        for (y in 1 until height - 1) {
+          var r = 0
+          var g = 0
+          var b = 0
+          for (kx in -1..1) {
+            for (ky in -1..1) {
+              val pixel = source.getPixel(x + kx, y + ky)
+              r += Color.red(pixel)
+              g += Color.green(pixel)
+              b += Color.blue(pixel)
+            }
+          }
+          blurredBitmap.setPixel(x, y, Color.rgb(r / 9, g / 9, b / 9))
+        }
+      }
+      source.recycle() // Recycle original
+      return blurredBitmap
     }
   }
 }
