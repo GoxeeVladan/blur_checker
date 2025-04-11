@@ -4,278 +4,239 @@ package com.example.blur_checker
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.os.AsyncTask
 import android.util.Log
 import androidx.annotation.NonNull
-import com.example.blur_checker.BlurCheckerUtils
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import java.io.File
+import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
+import kotlinx.coroutines.*
 
+// Keep LaplacianResult data class
 data class LaplacianResult(val stdDev: Double, val edgeCount: Int)
 
 object BlurCheckerUtils {
-  private const val PROCESSING_SCALE_FACTOR = 0.2
-  private const val MOSTLY_SOLID_THRESHOLD = 5
-  private const val MOSTLY_SOLID_SAMPLE_RATIO = 0.3
+  // --- Constants ---
+  private const val PROCESSING_SCALE_FACTOR = 0.15
+
+  // ** TUNING AREA 1: Solid Color Check **
+  private const val SOLID_RGB_STD_DEV_THRESHOLD = 15.0
+  private const val SOLID_SAMPLE_RATIO = 0.2
+  private const val SOLID_MIN_SAMPLES = 200
+
+  // Laplacian Kernel
   private const val LAPLACIAN_KERNEL_SIZE = 3
   private val LAPLACIAN_KERNEL = arrayOf(
     intArrayOf(0, -1, 0),
     intArrayOf(-1, 4, -1),
     intArrayOf(0, -1, 0)
   )
-  private const val SOBEL_KERNEL_SIZE = 3
-  private val SOBEL_X_KERNEL = arrayOf(
-    intArrayOf(-1, 0, 1),
-    intArrayOf(-2, 0, 2),
-    intArrayOf(-1, 0, 1)
-  )
-  private val SOBEL_Y_KERNEL = arrayOf(
-    intArrayOf(1, 2, 1),
-    intArrayOf(0, 0, 0),
-    intArrayOf(-1, -2, -1)
-  )
-  private const val DARK_CHANNEL_PATCH_SIZE = 7
 
+  // --- Public Score Computation ---
   fun computeLensDirtyScore(originalBitmap: Bitmap): Double {
-    val scaledBitmap = scaleBitmap(originalBitmap, PROCESSING_SCALE_FACTOR)
+    var scaledBitmap: Bitmap? = null
+    var blurredBitmap: Bitmap? = null // Bitmap for after pre-filtering
+    try {
+      scaledBitmap = scaleBitmap(originalBitmap, PROCESSING_SCALE_FACTOR)
+      val width = scaledBitmap.width; val height = scaledBitmap.height
+      val numPixels = width * height
+      if (width < 3 || height < 3 || numPixels == 0) return 0.0 // Need 3x3 for Laplacian/Blur
+      var pixels = IntArray(numPixels)
+      scaledBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
-    if (isMostlySolid(scaledBitmap, MOSTLY_SOLID_THRESHOLD, MOSTLY_SOLID_SAMPLE_RATIO)) {
-      scaledBitmap.recycle()
-      Log.d("LensCheck", "Image is mostly solid — returning 0.0")
-      return 0.0
+      // STEP 1: Solid Color Check (on original scaled pixels)
+      if (isMostlySolidRgb(pixels, numPixels, SOLID_RGB_STD_DEV_THRESHOLD, SOLID_SAMPLE_RATIO)) {
+        return 0.0
+      }
+
+      // --- Not Solid ---
+
+      // STEP 2: Pre-filter the image to reduce noise
+      // Create a mutable copy to apply blur to
+      blurredBitmap = scaledBitmap.copy(Bitmap.Config.ARGB_8888, true)
+      // Pass width and height, as numPixels isn't needed inside anymore
+      applyBoxBlur(blurredBitmap, width, height) // Apply simple 3x3 Box Blur in-place
+
+      // Get pixels FROM THE BLURRED BITMAP
+      pixels = IntArray(numPixels) // Re-use variable
+      blurredBitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+      // STEP 3: Calculate Metrics on Pre-filtered Image
+      val luminance = DoubleArray(numPixels) { i -> val p = pixels[i]; (0.2126*Color.red(p) + 0.7152*Color.green(p) + 0.0722*Color.blue(p))/255.0 }
+      val lapResult = computeLaplacianResult(luminance, width, height) // Use Laplacian again
+      val contrastStd = computeGlobalContrastStdDev(luminance)
+
+      // STEP 4: Normalize Scores
+      // ** TUNING AREA 2: Normalization Factors **
+      val focusScore = (lapResult.stdDev / 30.0).coerceIn(0.0, 1.0) // Moderate normalization
+      val contrastScore = (contrastStd * 255.0 / 40.0).coerceIn(0.0, 1.0) // Moderate normalization
+
+      // STEP 5: Logic Tree
+      // ** TUNING AREA 3: Thresholds **
+      val lowContrastThreshold = 0.10
+      val sharpnessThreshold = 0.40 // Threshold for focusScore
+
+      // Check 1: Low Contrast (Likely Solid that failed Step 1, now even lower contrast)
+      if (contrastScore < lowContrastThreshold) {
+        return 0.2
+      }
+      // Check 2: Sharp Image (Focus score still high after slight pre-blur)
+      else if (focusScore > sharpnessThreshold) {
+        return 0.1
+      }
+      // Check 3: Else (Likely Blurry)
+      else {
+        // Score based purely on lack of focus (post-filtering)
+        val finalScore = (1.0 - focusScore)
+        return finalScore.coerceIn(0.0, 1.0)
+      }
+
+    } catch (e: Exception) {
+      Log.e("LensCheck", "Error during score computation: ${e.message}", e)
+      return 0.5
+    } finally {
+      // Recycle both bitmaps if they were created
+      scaledBitmap?.recycle()
+      blurredBitmap?.recycle()
+    }
+  }
+
+  // --- Helper Functions ---
+
+  // Box blur implementation (simple 3x3 average) - applies IN PLACE
+  // Takes width and height as arguments now
+  private fun applyBoxBlur(bitmap: Bitmap, width: Int, height: Int) {
+    // val width = bitmap.width // Get from arguments
+    // val height = bitmap.height // Get from arguments
+    if (width < 3 || height < 3) return // Cannot apply 3x3 kernel
+
+    val numPixelsTotal = width * height // Calculate total pixels inside function if needed
+    val pixels = IntArray(numPixelsTotal)
+    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+    val blurredPixels = IntArray(pixels.size)
+
+    // Apply blur to inner pixels
+    for (y in 1 until height - 1) {
+      for (x in 1 until width - 1) {
+        var rSum = 0; var gSum = 0; var bSum = 0; var aSum = 0
+        for (ky in -1..1) {
+          for (kx in -1..1) {
+            val p = pixels[(y + ky) * width + (x + kx)]
+            aSum += Color.alpha(p)
+            rSum += Color.red(p)
+            gSum += Color.green(p)
+            bSum += Color.blue(p)
+          }
+        }
+        // Average the sums (integer division)
+        blurredPixels[y * width + x] = Color.argb(aSum / 9, rSum / 9, gSum / 9, bSum / 9)
+      }
     }
 
-    val lapResult = computeLaplacianResult(scaledBitmap)
-    val laplacianStd = lapResult.stdDev
-    val tenengrad = computeTenengradScore(scaledBitmap)
-    val contrastStd = computeGlobalContrastStdDev(scaledBitmap)
-    val brightness = computeAverageBrightness(scaledBitmap)
-    val darkChannelAvg = computeDarkChannelAverage(scaledBitmap)
-
-    scaledBitmap.recycle()
-
-    // Normalized feature values with more conservative clamping
-    val laplacianScaled = (laplacianStd / 30.0).coerceIn(0.0, 1.2)
-    val tenengradScaled = (tenengrad / 50.0).coerceIn(0.0, 0.9)
-    val contrastScaled = (contrastStd / 50.0).coerceIn(0.0, 0.9)
-    val darkChannelScaled = (darkChannelAvg / 60.0).coerceIn(0.0, 1.3)
-
-    // Adjust useTenengrad logic - consider contrast more strongly
-    val useTenengrad = (contrastStd < 18.0) || (brightness > 160) || (darkChannelAvg > 30)
-    val blendFactor = if (useTenengrad) 0.7 else 0.3
-
-    val edgeFocusScore = 1.0 - ((blendFactor * tenengradScaled) + ((1 - blendFactor) * laplacianScaled))
-
-    var dirtyScore = (0.4 * darkChannelScaled) +
-            (0.35 * (1.0 - contrastScaled)) +
-            (0.25 * edgeFocusScore)
-
-    // Reduce impact of dark channel if contrast is very low
-    if (contrastStd < 8.0) {
-      dirtyScore -= 0.3 * darkChannelScaled.coerceAtMost(0.6)
-      dirtyScore = dirtyScore.coerceAtLeast(0.0)
+    // Handle borders (simple copy - could be improved with edge handling)
+    for (y in 0 until height) {
+      if (width > 0) {
+        blurredPixels[y * width + 0] = pixels[y * width + 0] // Left edge
+        if (width > 1) {
+          blurredPixels[y * width + (width - 1)] = pixels[y * width + (width - 1)] // Right edge
+        }
+      }
+    }
+    for (x in 1 until width - 1) {
+      if (height > 0) {
+        blurredPixels[0 * width + x] = pixels[0 * width + x] // Top edge
+        if (height > 1) {
+          blurredPixels[(height - 1) * width + x] = pixels[(height - 1) * width + x] // Bottom edge
+        }
+      }
+    }
+    // Handle corners explicitly (simplest way to ensure they are copied)
+    if (width > 0 && height > 0) {
+      blurredPixels[0] = pixels[0] // Top-Left
+      if (width > 1) blurredPixels[width - 1] = pixels[width - 1] // Top-Right
+      if (height > 1) blurredPixels[(height - 1) * width] = pixels[(height - 1) * width] // Bottom-Left
+      // *** CORRECTED LINE ***
+      if (width > 1 && height > 1) blurredPixels[width * height - 1] = pixels[width * height - 1] // Bottom-Right
     }
 
-    // Adjust based on edge strength
-    val edgeWeightFactor = when {
-      edgeFocusScore > 0.8 -> 0.5
-      edgeFocusScore < 0.3 -> 0.85
-      else -> 1.0
-    }
 
-    val adjustedScore = dirtyScore * edgeWeightFactor
-
-    val hazeTrigger = (darkChannelScaled > 0.6 && contrastStd < 16) || (darkChannelScaled > 1.0)
-    return if (hazeTrigger && adjustedScore < 0.65) 0.70 else adjustedScore
+    // Set the blurred pixels back onto the original bitmap
+    bitmap.setPixels(blurredPixels, 0, width, 0, 0, width, height)
   }
 
   private fun scaleBitmap(bitmap: Bitmap, factor: Double): Bitmap {
-    return Bitmap.createScaledBitmap(
-      bitmap,
-      (bitmap.width * factor).toInt().coerceAtLeast(1),
-      (bitmap.height * factor).toInt().coerceAtLeast(1),
-      true
-    )
+    val newWidth = (bitmap.width * factor).toInt().coerceAtLeast(1)
+    val newHeight = (bitmap.height * factor).toInt().coerceAtLeast(1)
+    return Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
   }
 
-  private fun isMostlySolid(bitmap: Bitmap, threshold: Int, sampleRatio: Double): Boolean {
-    val width = bitmap.width
-    val height = bitmap.height
-    val numPixels = width * height
+  private fun isMostlySolidRgb(pixels: IntArray, numPixels: Int, stdDevThreshold: Double, sampleRatio: Double): Boolean {
     if (numPixels <= 1) return true
-
-    val numSamples = (numPixels * sampleRatio).toInt().coerceAtLeast(50)
-    val pixels = IntArray(numSamples)
+    val numSamples = (numPixels * sampleRatio).toInt().coerceAtLeast(SOLID_MIN_SAMPLES).coerceAtMost(numPixels)
+    if (numSamples < 2) return true
+    val samplesR = DoubleArray(numSamples); val samplesG = DoubleArray(numSamples); val samplesB = DoubleArray(numSamples)
     val random = java.util.Random()
-
-    val baseColor = bitmap.getPixel(random.nextInt(width), random.nextInt(height))
-    val r0 = Color.red(baseColor)
-    val g0 = Color.green(baseColor)
-    val b0 = Color.blue(baseColor)
-
-    var totalDiff = 0L
+    var sumR = 0.0; var sumG = 0.0; var sumB = 0.0
     for (i in 0 until numSamples) {
-      val x = random.nextInt(width)
-      val y = random.nextInt(height)
-      val p = bitmap.getPixel(x, y)
-      totalDiff += kotlin.math.abs(Color.red(p) - r0) +
-              kotlin.math.abs(Color.green(p) - g0) +
-              kotlin.math.abs(Color.blue(p) - b0)
+      val index = random.nextInt(numPixels); val p = pixels[index]
+      val r = Color.red(p).toDouble(); val g = Color.green(p).toDouble(); val b = Color.blue(p).toDouble()
+      samplesR[i] = r; samplesG[i] = g; samplesB[i] = b
+      sumR += r; sumG += g; sumB += b
     }
-
-    val avgDiff = totalDiff.toDouble() / numSamples
-    return avgDiff < threshold
+    val meanR = sumR / numSamples; val meanG = sumG / numSamples; val meanB = sumB / numSamples
+    val varianceR = samplesR.sumOf { (it - meanR).pow(2) } / numSamples
+    val varianceG = samplesG.sumOf { (it - meanG).pow(2) } / numSamples
+    val varianceB = samplesB.sumOf { (it - meanB).pow(2) } / numSamples
+    val stdDevR = sqrt(varianceR); val stdDevG = sqrt(varianceG); val stdDevB = sqrt(varianceB)
+    return stdDevR < stdDevThreshold && stdDevG < stdDevThreshold && stdDevB < stdDevThreshold
   }
 
-  private fun computeLaplacianResult(bitmap: Bitmap): LaplacianResult {
-    val width = bitmap.width
-    val height = bitmap.height
-    if (width < LAPLACIAN_KERNEL_SIZE || height < LAPLACIAN_KERNEL_SIZE) {
-      return LaplacianResult(0.0, 0)
-    }
-
-    val gray = Array(height) { IntArray(width) }
-    for (y in 0 until height) {
-      for (x in 0 until width) {
-        gray[y][x] = (Color.luminance(bitmap.getPixel(x, y)) * 255).toInt()
-      }
-    }
-
-    var sum = 0.0
-    var sumSq = 0.0
-    var count = 0
-    var strongEdgeCount = 0
-    val edgeThreshold = 20
-
-    for (y in 1 until height - 1) {
-      for (x in 1 until width - 1) {
-        var laplacianValue = 0
-        for (ky in -1..1) {
-          for (kx in -1..1) {
-            laplacianValue += gray[y + ky][x + kx] * LAPLACIAN_KERNEL[ky + 1][kx + 1]
+  private fun computeLaplacianResult(luminance: DoubleArray, width: Int, height: Int): LaplacianResult {
+    val grayInt = IntArray(luminance.size) { (luminance[it] * 255).toInt() }
+    var sum = 0.0; var sumSq = 0.0; var count = 0; var strongEdgeCount = 0
+    val edgeThreshold = 20 // Keep this edge counting, might be useful later
+    val kernelSize = LAPLACIAN_KERNEL_SIZE
+    val kernelRadius = kernelSize / 2
+    for (y in kernelRadius until height - kernelRadius) {
+      for (x in kernelRadius until width - kernelRadius) {
+        var laplacianValue = 0.0
+        for (ky in -kernelRadius..kernelRadius) {
+          for (kx in -kernelRadius..kernelRadius) {
+            laplacianValue += grayInt[(y + ky) * width + (x + kx)] * LAPLACIAN_KERNEL[ky + kernelRadius][kx + kernelRadius]
           }
         }
-        val v = laplacianValue.toDouble()
-        sum += v
-        sumSq += v * v
-        if (kotlin.math.abs(v) > edgeThreshold) strongEdgeCount++
+        sum += laplacianValue; sumSq += laplacianValue * laplacianValue
+        if (kotlin.math.abs(laplacianValue) > edgeThreshold) strongEdgeCount++ // Use kotlin.math.abs
         count++
       }
     }
-
-    val variance = if (count > 0) (sumSq / count) - (sum / count).pow(2) else 0.0
+    if (count == 0) return LaplacianResult(0.0, 0)
+    val mean = sum / count
+    val variance = (sumSq / count) - (mean * mean)
     return LaplacianResult(sqrt(variance.coerceAtLeast(0.0)), strongEdgeCount)
   }
 
-  private fun computeGlobalContrastStdDev(bitmap: Bitmap): Double {
-    val width = bitmap.width
-    val height = bitmap.height
-    val luminanceValues = DoubleArray(width * height)
-    for (y in 0 until height) {
-      for (x in 0 until width) {
-        luminanceValues[y * width + x] = Color.luminance(bitmap.getPixel(x, y)).toDouble()
-      }
-    }
-    if (luminanceValues.isEmpty()) return 0.0
-    val mean = luminanceValues.average()
-    val variance = luminanceValues.sumOf { (it - mean).pow(2) } / luminanceValues.size
-    return sqrt(variance)
+  private fun computeGlobalContrastStdDev(luminance: DoubleArray): Double {
+    if (luminance.isEmpty()) return 0.0
+    val mean = luminance.average()
+    val variance = luminance.sumOf { (it - mean).pow(2) } / luminance.size
+    return sqrt(variance.coerceAtLeast(0.0))
   }
+  // Removed computeAverageBrightness, computeDarkChannelAverage, convertToGrayscale, computeMeanGradientMagnitude
 
-  private fun computeDarkChannelAverage(bitmap: Bitmap): Double {
-    val width = bitmap.width
-    val height = bitmap.height
-    if (width < DARK_CHANNEL_PATCH_SIZE || height < DARK_CHANNEL_PATCH_SIZE) {
-      var minVal = 255
-      for (y in 0 until height) {
-        for (x in 0 until width) {
-          val pixel = bitmap.getPixel(x, y)
-          minVal = minOf(Color.red(pixel), Color.green(pixel), Color.blue(pixel), minVal)
-        }
-      }
-      return minVal.toDouble()
-    }
+} // End of BlurCheckerUtils object
 
-    val pad = DARK_CHANNEL_PATCH_SIZE / 2
-    var sum = 0
-    var count = 0
 
-    for (y in 0 until height) {
-      for (x in 0 until width) {
-        var localMin = 255
-        for (dy in -pad..pad) {
-          for (dx in -pad..pad) {
-            val ny = y + dy
-            val nx = x + dx
-            if (ny in 0 until height && nx in 0 until width) {
-              val pixel = bitmap.getPixel(nx, ny)
-              localMin = minOf(Color.red(pixel), Color.green(pixel), Color.blue(pixel), localMin)
-            }
-          }
-        }
-        sum += localMin
-        count++
-      }
-    }
-    return if (count > 0) sum.toDouble() / count else 0.0
-  }
-
-  private fun computeAverageBrightness(bitmap: Bitmap): Double {
-    val width = bitmap.width
-    val height = bitmap.height
-    var totalLuminance = 0.0
-    for (y in 0 until height) {
-      for (x in 0 until width) {
-        totalLuminance += Color.luminance(bitmap.getPixel(x, y))
-      }
-    }
-    return if (width * height > 0) (totalLuminance / (width * height)) * 255 else 0.0
-  }
-
-  private fun computeTenengradScore(bitmap: Bitmap): Double {
-    val width = bitmap.width
-    val height = bitmap.height
-    if (width < SOBEL_KERNEL_SIZE || height < SOBEL_KERNEL_SIZE) {
-      return 0.0
-    }
-
-    val gray = Array(height) { IntArray(width) }
-    for (y in 0 until height) {
-      for (x in 0 until width) {
-        gray[y][x] = (Color.luminance(bitmap.getPixel(x, y)) * 255).toInt()
-      }
-    }
-
-    var sumMagnitude = 0.0
-    var count = 0
-
-    for (y in 1 until height - 1) {
-      for (x in 1 until width - 1) {
-        var gx = 0
-        var gy = 0
-        for (ky in -1..1) {
-          for (kx in -1..1) {
-            val pixelValue = gray[y + ky][x + kx]
-            gx += pixelValue * SOBEL_X_KERNEL[ky + 1][kx + 1]
-            gy += pixelValue * SOBEL_Y_KERNEL[ky + 1][kx + 1]
-          }
-        }
-        sumMagnitude += sqrt((gx * gx + gy * gy).toDouble())
-        count++
-      }
-    }
-    return if (count > 0) sumMagnitude / count else 0.0
-  }
-}
-
+// --- Flutter Plugin Class ---
 class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
   private lateinit var channel: MethodChannel
+  // Use Default dispatcher for CPU-bound work like image processing
+  private val coroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
   override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel = MethodChannel(binding.binaryMessenger, "blur_checker_native")
@@ -284,65 +245,69 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 
   override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
     when (call.method) {
-      "getLensDirtyScore" -> {
+      "getLensDirtyScore", "isLensDirty" -> {
         val path = call.argument<String>("path")
         if (path == null) {
           result.error("ARGUMENT_ERROR", "Path argument is required", null)
           return
         }
-        ProcessImageTask(path, false, result).execute()
-      }
+        val isCheck = call.method == "isLensDirty"
+        // Default threshold based on expected blurry score range (1.0 - focusScore)
+        val threshold = call.argument<Double>("threshold") ?: 0.7
 
-      "isLensDirty" -> {
-        val path = call.argument<String>("path")
-        if (path == null) {
-          result.error("ARGUMENT_ERROR", "Path argument is required", null)
-          return
+        coroutineScope.launch { // Launch on the scope's dispatcher (Default)
+          try {
+            val score = processImage(path) // processImage uses Dispatchers.IO internally
+            // Switch back to main thread to return result to Flutter
+            withContext(Dispatchers.Main) {
+              when (score) {
+                null -> result.error("PROCESSING_ERROR", "Failed to process image", null)
+                else -> {
+                  if (isCheck) { result.success(score >= threshold) }
+                  else { result.success(score) }
+                }
+              }
+            }
+          } catch (e: Exception) {
+            Log.e("BlurCheckerPlugin", "Error in Coroutine: ${e.message}", e)
+            withContext(Dispatchers.Main) {
+              result.error("COROUTINE_ERROR", "Exception during processing: ${e.message}", null)
+            }
+          }
         }
-        ProcessImageTask(path, true, result).execute()
       }
-
       else -> result.notImplemented()
     }
   }
 
-  override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
-    channel.setMethodCallHandler(null)
+  // This suspend function runs the image processing off the main thread
+  private suspend fun processImage(path: String): Double? = withContext(Dispatchers.IO) { // Use IO dispatcher for file access
+    val file = File(path)
+    if (!file.exists()) { Log.e("BlurCheckerPlugin", "File does not exist: $path"); return@withContext null }
+    val absolutePath = file.absolutePath
+    var bitmap: Bitmap? = null
+    try {
+      // Decode with sampling using target 640x640
+      bitmap = decodeSampledBitmap(absolutePath, 640, 640)
+      if (bitmap == null) { Log.e("BlurCheckerPlugin", "Failed to decode bitmap: $path"); return@withContext null }
+      // Perform the core score computation (CPU-bound, but already off main thread)
+      val score = BlurCheckerUtils.computeLensDirtyScore(bitmap)
+      return@withContext score
+    } catch (e: Exception) { Log.e("BlurCheckerPlugin", "Error processing image $path: ${e.message}", e); return@withContext null }
+    finally { bitmap?.recycle() } // Ensure bitmap is recycled
   }
 
-  private inner class ProcessImageTask(
-    private val path: String,
-    private val isLensDirtyCheck: Boolean,
-    private val result: MethodChannel.Result
-  ) : AsyncTask<Void, Void, Any?>() {
+  override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+    channel.setMethodCallHandler(null)
+    // Cancel all coroutines started by this scope when the engine detaches
+    coroutineScope.cancel()
+  }
 
-    override fun doInBackground(vararg params: Void?): Any? {
-      val path = File(path).absolutePath
-      var bitmap = decodeSampledBitmap(path, 640, 640) // Example: Target 640x640
-      if (bitmap == null) {
-        return "BITMAP_NULL"
-      }
-
-      bitmap = applyGaussianBlur(bitmap, 3f) // Apply smoothing (adjust radius)
-
-      val score = BlurCheckerUtils.computeLensDirtyScore(bitmap)
-      bitmap.recycle()
-      return if (isLensDirtyCheck) score >= 0.7 else score
-    }
-
-    override fun onPostExecute(returnValue: Any?) {
-      when (returnValue) {
-        is Double -> result.success(returnValue)
-        is Boolean -> result.success(returnValue)
-        is String -> result.error(returnValue, "Failed to decode image", null)
-        null -> result.error("NULL_RESULT", "Image processing failed", null)
-      }
-    }
-
-    private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+  // --- Bitmap Decoding Helpers ---
+  private fun decodeSampledBitmap(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+    return try {
       // First decode with inJustDecodeBounds=true to check dimensions
-      val options = BitmapFactory.Options()
-      options.inJustDecodeBounds = true
+      val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
       BitmapFactory.decodeFile(path, options)
 
       // Calculate inSampleSize
@@ -350,57 +315,29 @@ class BlurCheckerPlugin : FlutterPlugin, MethodCallHandler {
 
       // Decode bitmap with inSampleSize set
       options.inJustDecodeBounds = false
-      return BitmapFactory.decodeFile(path, options)
-    }
-
-    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
-      // Raw height and width of image
-      val height = options.outHeight
-      val width = options.outWidth
-      var inSampleSize = 1
-
-      if (height > reqHeight || width > reqWidth) {
-        val halfHeight = height / 2
-        val halfWidth = width / 2
-
-        // Calculate the largest inSampleSize value that is a power of 2 and keeps both
-        // height and width larger than the requested height and width.
-        while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
-          inSampleSize *= 2
-        }
-      }
-
-      return inSampleSize
-    }
-    private fun applyGaussianBlur(source: Bitmap, radius: Float): Bitmap {
-      // Implementation of Gaussian blur (simplified example - consider RenderScript or NDK)
-      val width = source.width
-      val height = source.height
-      val blurredBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-      val canvas = android.graphics.Canvas(blurredBitmap)
-      val paint = android.graphics.Paint()
-      paint.flags = android.graphics.Paint.FILTER_BITMAP_FLAG
-      canvas.drawBitmap(source, 0f, 0f, paint) // Draw original
-
-      // Very basic averaging blur (replace with proper Gaussian)
-      for (x in 1 until width - 1) {
-        for (y in 1 until height - 1) {
-          var r = 0
-          var g = 0
-          var b = 0
-          for (kx in -1..1) {
-            for (ky in -1..1) {
-              val pixel = source.getPixel(x + kx, y + ky)
-              r += Color.red(pixel)
-              g += Color.green(pixel)
-              b += Color.blue(pixel)
-            }
-          }
-          blurredBitmap.setPixel(x, y, Color.rgb(r / 9, g / 9, b / 9))
-        }
-      }
-      source.recycle() // Recycle original
-      return blurredBitmap
-    }
+      options.inPreferredConfig = Bitmap.Config.ARGB_8888 // Prefer ARGB_8888 for quality
+      BitmapFactory.decodeFile(path, options)
+    } catch (e: Exception) { Log.e("BlurCheckerPlugin", "Decode Error: $path - ${e.message}"); null }
+    catch (oome: OutOfMemoryError) { Log.e("BlurCheckerPlugin", "OOM Error decoding bitmap: $path"); null } // Catch OOM specifically
   }
-}
+
+  private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
+    // Raw height and width of image
+    val (height, width) = options.outHeight to options.outWidth
+    var inSampleSize = 1
+
+    if (height > reqHeight || width > reqWidth) {
+      val halfHeight = height / 2; val halfWidth = width / 2
+      // Calculate the largest inSampleSize value that is a power of 2 and keeps both
+      // height and width larger than the requested height and width.
+      while ((halfHeight / inSampleSize) >= reqHeight && (halfWidth / inSampleSize) >= reqWidth) {
+        inSampleSize *= 2
+      }
+      // This additional loop helps RARE cases where the image is VERY large
+      while ((width / inSampleSize) > reqWidth * 2 || (height / inSampleSize) > reqHeight * 2) {
+        inSampleSize *= 2;
+      }
+    }
+    return inSampleSize
+  }
+} // End of BlurCheckerPlugin class
